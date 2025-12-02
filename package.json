@@ -1,0 +1,29 @@
+{
+  "name": "misc",
+  "version": "1.0.0",
+  "description": "```mermaid\r sequenceDiagram\r     participant browser\r     participant server\r     browser->>server: GET https://studies.cs.helsinki.fi/exampleapp/\r     activate server\r     server-->>browser: HTML document\r     deactivate server\r     browser->>server: GET https://studies.cs.helsinki.fi/exampleapp/kuva.png\r     activate server\r     server-->>browser: the png pic\r     deactivate server\r     Note right of browser: Page with a pic will is rendered\r ```",
+  "homepage": "https://github.com/fullstack-hy2020/misc#readme",
+  "bugs": {
+    "url": "https://github.com/fullstack-hy2020/misc/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fullstack-hy2020/misc.git"
+  },
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "library-backend.js",
+  "scripts": {
+    "test": "test",
+    "start": "node library-backend.js"
+  },
+  "dependencies": {
+    "@apollo/server": "^5.1.0",
+    "bcryptjs": "^3.0.3",
+    "dotenv": "^17.2.3",
+    "graphql": "^16.12.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^9.0.0"
+  }
+}
