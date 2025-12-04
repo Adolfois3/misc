@@ -1,5 +1,11 @@
 const { ApolloServer } = require('@apollo/server')
-const { startStandaloneServer } = require('@apollo/server/standalone')
+// Importaciones para el servidor con Express y WebSockets
+const { expressMiddleware } = require('@apollo/server/express4')
+const { ApolloServerPluginDrainHttpServer } = require('@apollo/server/plugin/drainHttpServer')
+const { makeExecutableSchema } = require('@graphql-tools/schema')
+const express = require('express')
+const cors = require('cors')
+const http = require('http')
 const mongoose = require("mongoose")
 mongoose.set('strictQuery', false)
 const Book = require('./models/modelsBooks')
@@ -8,6 +14,10 @@ const { GraphQLError } = require('graphql')
 const User = require('./models/user')
 const bcryptjs = require('bcryptjs')
 const jwt = require("jsonwebtoken")
+const { WebSocketServer } = require('ws')
+const { useServer } = require('graphql-ws/lib/use/ws')
+const {PubSub} = require('graphql-subscriptions')
+const pubsub = new PubSub()
 
 require('dotenv').config()
 
@@ -32,14 +42,14 @@ type Author{
 }
   type User{
   username:String!,
-  favoriteGenre:[ID]
+  favoriteGenre:String
   id:ID!
   }
 
 type Book{
   title:String!
   published: Int!
-  author:Author!
+  author: Author!
   id: ID!
   genres: [String!]
 }
@@ -47,17 +57,22 @@ type Book{
   value:String!
   }
 
+  type Subscription{
+  bookAdded:Book!
+  }
+
 type Query {
   bookCount: Int!
   authorCount: Int!
-  allAuthor: [Author!]! 
-  allBooks: [Book!]! 
+  allAuthor: [Author!]!
+  allBooks(genre: String): [Book!]!
   me:User
 }
 
 type Mutation{
 createUser(
-username:String!
+username:String!,
+password: String!
 ):User
 
 login(
@@ -78,6 +93,10 @@ addBorn(
   name:String!
   setBorn:Int!
 ):Author!
+
+editFavoriteGenre(
+  genre: String!
+): User
 }
 `
 
@@ -98,15 +117,23 @@ const resolvers = {
     allAuthor: async (root, args) => {
       return Author.find({})
     },
-    allBooks: async (root,args)=>{
-      return Book.find({})
+    allBooks: async (root, args) => {
+      if (args.genre) {
+        // Si se proporciona un género, filtra los libros que lo incluyan en su array de géneros.
+        return Book.find({ genres: { $in: [args.genre] } }).populate('author')
+      }
+      return Book.find({}).populate('author')
     },
   },
 
   Mutation:{
-    createUser: async(root, args)=>{
+    createUser: async (root, args) => {
       try{
-      const user =  new User({username: args.username})
+        const saltRounds = 10
+        const passwordHash = await bcryptjs.hash(args.password, saltRounds)
+
+        const user = new User({ username: args.username, passwordHash })
+
       return user.save()
       }catch(error){
         throw new  GraphQLError("Creating user error",{
@@ -118,16 +145,20 @@ const resolvers = {
         })
       }
     },
-    login: async(root, args)=>{
-      const user = await User.findOne({username:args.username})
-      if(!user || args.password !== 'secret'){
+    login: async (root, args) => {
+      const user = await User.findOne({ username: args.username })
+
+      const passwordCorrect = user === null
+        ? false
+        : await bcryptjs.compare(args.password, user.passwordHash)
+
+      if (!(user && passwordCorrect)) {
                 throw new  GraphQLError("error credentials",{
           extensions:{
             code: 'BAD_USER_INPUT',
           }
         })
       }
-
       const userForToken={
         username: user.username,
         id:user._id.toString()
@@ -151,10 +182,12 @@ const resolvers = {
       try{
         await author.save()
       }catch(error){
-        throw new GraphQLError(error,{
+        throw new GraphQLError(`Error saving author: ${error.message}`, {
+          extensions: {
             code: 'BAD_USER_INPUT',
-            invalidArgs: args.name,
+            invalidArgs: args.author,
             error
+          }
         })
       }
       const newBook = new Book({
@@ -164,26 +197,25 @@ const resolvers = {
         genres: args.genres
       })
       try{
-        await newBook.save()
-        return newBook.populate('author')
+      const savedBook = await newBook.save()
+        const populatedBook = await savedBook.populate('author')
+        pubsub.publish('BOOK_ADDED', { bookAdded: populatedBook })
+        return populatedBook
       }catch(error){
         throw new GraphQLError("Saving book failed",{
           extensions:{
             code: 'BAD_USER_INPUT',
-            invalidArgs: args.name,
+            invalidArgs: args.title,
             error
           }
         })
       }
-      
-    },
 
+    },
+    
     addBorn: async (root, {name, setBorn}, context)=>{
 
       const currentUser = context.currentUser
-      if(currentUser){
-        console.log("Persona encontrada", currentUser)
-      }
             if(!currentUser){
         throw new GraphQLError("No autenticado",{extensions:{code:'FORBIDEN'}})
       }
@@ -205,45 +237,96 @@ const resolvers = {
           }
         })
       }
+    },
+
+    editFavoriteGenre: async (root, args, context) => {
+      const currentUser = context.currentUser
+      if (!currentUser) {
+        throw new GraphQLError("No autenticado", { extensions: { code: 'FORBIDEN' } })
+      }
+
+      const user = await User.findById(currentUser.id)
+      user.favoriteGenre = args.genre
+      try {
+        await user.save()
+        return user
+      } catch (error) {
+        throw new GraphQLError("Failed to set favorite genre", {
+          extensions: { code: 'BAD_USER_INPUT', error }
+        })
+      }
+    }
+  },
+  // El resolver de Subscription debe estar al mismo nivel que Query y Mutation
+  Subscription: {
+    bookAdded: {
+      subscribe: () => pubsub.asyncIterator(['BOOK_ADDED'])
     }
   }
 }
 
-const server = new ApolloServer({
-  typeDefs,
-  resolvers,
-})
+const start = async () => {
+  const app = express()
+  const httpServer = http.createServer(app)
 
+  const schema = makeExecutableSchema({ typeDefs, resolvers })
 
+  // Configuración del servidor WebSocket
+  const wsServer = new WebSocketServer({
+    server: httpServer,
+    path: '/',
+  })
 
+  const serverCleanup = useServer({ schema }, wsServer)
 
-startStandaloneServer(server, {
-  listen: { port: 4000 },
+  // Configuración del servidor Apollo
+  const server = new ApolloServer({
+    schema,
+    introspection: true,
+    plugins: [
+      // Plugin para cerrar correctamente el servidor HTTP
+      ApolloServerPluginDrainHttpServer({ httpServer }),
+      // Plugin para cerrar correctamente el servidor WebSocket
+      {
+        async serverWillStart() {
+          return {
+            async drainServer() {
+              await serverCleanup.dispose();
+            },
+          };
+        },
+      },
+    ],
+  })
 
-  context: async({req, res})=>{
-       const auth = req ? req.headers.authorization : null
-       console.log("--- SOLICITUD RECIBIDA ---");
+  await server.start()
 
-       console.log("Header Auth:", auth);
+  // Middleware para las peticiones GraphQL sobre HTTP
+  app.use(
+    '/',
+    cors(),
+    express.json(),
+    expressMiddleware(server, {
+      context: async ({ req }) => {
+        const auth = req ? req.headers.authorization : null
+        if (auth && auth.startsWith('Bearer ')) {
+          try {
+            const decodedToken = jwt.verify(auth.substring(7), process.env.JWT_SECRET)
+            const currentUser = await User.findById(decodedToken.id)
+            return { currentUser }
+          } catch (error) {
+            console.log('Error al verificar el token:', error.message)
+          }
+        }
+        return {}
+      },
+    }),
+  )
 
-       let currentUser = null
-    if (auth && auth.startsWith('Bearer ')) {
-      try{
-        const decodedToken = jwt.verify(auth.substring(7), process.env.JWT_SECRET)
-        console.log("Token decodificado:", decodedToken)
-      currentUser = await User.findById(decodedToken.id)
-      console.log("Usuario encontrado:", currentUser ? currentUser.username : "NULO")
-    }catch(error){
-      throw new GraphQLError(`Error de verificación JWT: ${error.message}`, { 
-          extensions: {
-            code: 'UNAUTHORIZED',
-            originalErrorName: error.name // Esto es clave
-          }
-        })
-    }
-    }
-    return { currentUser }
-  }
-}).then(({ url }) => {
-  console.log(`Server ready at ${url}`)
-})
+  const PORT = 4000
+  httpServer.listen(PORT, () =>
+    console.log(`🚀 Server ready at http://localhost:${PORT}`)
+  )
+}
+
+start()

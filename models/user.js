@@ -8,9 +8,10 @@ const schema = new mongoose.Schema({
         unique:true,
         minlength:3,
     },
-    favoriteGenre:[{
+    favoriteGenre:{
         type:String
-    }]
+    },
+    passwordHash: String
 })
 
 
